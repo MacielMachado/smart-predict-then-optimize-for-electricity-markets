@@ -29,7 +29,8 @@ selling is not allowed.
 function portfolio_simplex_oracle_jump_basic(c::Vector{Float64}, Sigma::Matrix{Float64}, gamma::Float64)
     d = length(c)
 
-    mod = Model(with_optimizer(Gurobi.Optimizer, OutputFlag = 0))
+    mod = Model(() -> Gurobi.Optimizer())
+    set_optimizer_attribute(mod, "OutputFlag", 0)
     @variable(mod, w[1:d] >= 0)
     @constraint(mod, sum(w[i] for i = 1:d) <= 1)
     @constraint(mod, w'*Sigma*w <= gamma)
@@ -54,7 +55,7 @@ function portfolio_simplex_jump_setup(Sigma::Matrix{Float64}, gamma::Float64; gu
         error("Sigma dimensions don't match")
     end
 
-    mod = Model(with_optimizer(Gurobi.Optimizer, gurobiEnv))
+    mod = Model(() -> Gurobi.Optimizer(gurobiEnv))
     @variable(mod, w[1:d] >= 0)
     @constraint(mod, sum(w[i] for i = 1:d) <= 1)
     @constraint(mod, w'*Sigma*w <= gamma)
@@ -70,4 +71,4 @@ function portfolio_simplex_jump_setup(Sigma::Matrix{Float64}, gamma::Float64; gu
     end
 
     return c -> local_portfolio_oracle(c)
-end
+end 

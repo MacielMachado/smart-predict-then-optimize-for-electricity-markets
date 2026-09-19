@@ -248,6 +248,7 @@ function spoPlus_sgd(X::Matrix{Float64}, c::Matrix{Float64}, oracle;
     returned_iter = numiter - 1 # default if we do not do holdout
 
     for iter = 0:(numiter - 1)
+        println("spoPlus_sgd iter = $iter")
         # call subgradient and step-size functions
         G_iter = subgrad(B_iter)
         step_iter = step_size(iter, G_iter)
@@ -324,7 +325,8 @@ end
     second_moment_bound::Symbol = :practical
     obj_accuracy::Float64 = 0.0001
     batchsize::Int = 10
-    iteration_limit::Int = 10000
+    # iteration_limit::Int = 10000 # <<<
+    iteration_limit::Int = 100
     step_type::Symbol = :short
     verbose::Bool = false
 end

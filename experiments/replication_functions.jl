@@ -486,11 +486,11 @@ function portfolio_multiple_replications(rng_seed, num_trials,
     envOracle = setup_gurobi_env(method_type = :default, use_time_limit = false)
     envReform = setup_gurobi_env(method_type = :method3, use_time_limit = false)
 
-    for n_train in n_train_vec
-        for n_sigmoid_polydegree in n_sigmoid_polydegree_vec
-            for noise_multiplier_tau in noise_multiplier_tau_vec
+    for n_train in n_train_vec # Número de instâncias de treinamento n
+        for n_sigmoid_polydegree in n_sigmoid_polydegree_vec # Grau de não-linearidade da função geradora c(x) 
+            for noise_multiplier_tau in noise_multiplier_tau_vec # o quão "ruidosa" é a relação entre features e custos reais
                 println("Moving on to n_train = $n_train, n_sigmoid_polydegree = $n_sigmoid_polydegree, noise_multiplier_tau = $noise_multiplier_tau")
-                for trial = 1:num_trials
+                for trial = 1:num_trials # Quantidade de repetições
                     println("Current trial is $trial")
                     n_holdout = round(Int, holdout_percent*n_train)
 
