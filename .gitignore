@@ -35,3 +35,9 @@ Manifest.toml
 
 # R History
 .Rhistory
+
+# Dataset
+*.csv
+*.log
+*.png
+*.txt

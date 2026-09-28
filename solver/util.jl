@@ -443,3 +443,34 @@ function setup_gurobi_env(; quiet_mode = true, method_type = :barrier, use_time_
 
 	return env
 end
+
+"""
+	weighted_cvar(costs, probabilities, alpha)
+
+Compute the finite-scenario Rockafellar-Uryasev CVaR. This is distinct from
+the empirical VaR, which is only a quantile of the scenario costs.
+"""
+function weighted_cvar(costs::AbstractVector{<:Real}, probabilities::AbstractVector{<:Real}, alpha::Real)
+	length(costs) == length(probabilities) || error("cost/probability dimensions mismatch")
+	probs = Vector{Float64}(probabilities)
+	values = Vector{Float64}(costs)
+	all(probs .>= 0) || error("probabilities must be nonnegative")
+	isapprox(sum(probs), 1.0; atol = 1e-10) || error("probabilities must sum to one")
+	0 < alpha < 1 || error("alpha must be strictly between zero and one")
+	etas = sort(unique(values))
+	return minimum(eta + dot(probs, max.(values .- eta, 0.0)) / (1.0 - alpha) for eta in etas)
+end
+
+"""Return the weighted empirical VaR quantile for comparison with CVaR."""
+function weighted_var(costs::AbstractVector{<:Real}, probabilities::AbstractVector{<:Real}, alpha::Real)
+	length(costs) == length(probabilities) || error("cost/probability dimensions mismatch")
+	order = sortperm(costs)
+	cumulative = 0.0
+	for index in order
+		cumulative += probabilities[index]
+		if cumulative >= alpha
+			return costs[index]
+		end
+	end
+	return maximum(costs)
+end
