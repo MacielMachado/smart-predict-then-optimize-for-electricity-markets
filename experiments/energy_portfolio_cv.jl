@@ -1,15 +1,17 @@
 include("energy_portfolio_run.jl")
-include("../solver/energy_cross_validation.jl")
 
 function run_energy_portfolio_cv(; data_dir = "data/training_dataset",
     output_dir = "energy_cv_results", evaluation_mode::Symbol = :rolling_origin,
     beta = 0.4, alpha = 0.95, gamma = 0.99, delta_inf = 0.9, delta_sup = 1.1,
     lambda = 1e-4, num_epochs = 2000, batchsize = 100, step_size = 1e-8,
-    first_test_year = nothing, last_test_year = nothing)
+    first_test_year = nothing, last_test_year = nothing, min_train_years = 5,
+    generator_variant = :G2, psi = 10.0, num_scenarios = 200, num_scenarios_test = 1000, seed = 1)
     dataset = load_energy_dataset(data_dir)
-    folds = build_energy_year_folds(dataset; evaluation_mode, first_test_year, last_test_year)
+    folds = build_energy_year_folds(dataset; evaluation_mode, first_test_year, last_test_year, min_train_years)
     mkpath(output_dir)
     results = EnergyYearEvaluation[]
+    assessment = DataFrame(test_year = Int[], coverage_90 = Float64[], energy_score = Float64[])
+    realized_test_costs = (mse = Float64[], spo = Float64[])
 
     for fold in folds
         normalization = fit_energy_normalization(dataset.X[:, fold.train_indices],
@@ -22,9 +24,15 @@ function run_energy_portfolio_cv(; data_dir = "data/training_dataset",
         X_test = X_normalized[:, fold.test_indices]
         c_test = dataset.c[:, fold.test_indices]
 
-        train_oracles = build_energy_oracles(dataset, fold.train_indices; beta, alpha, gamma, delta_inf, delta_sup)
-        validation_oracles = build_energy_oracles(dataset, fold.validation_indices; beta, alpha, gamma, delta_inf, delta_sup)
-        test_oracles = build_energy_oracles(dataset, fold.test_indices; beta, alpha, gamma, delta_inf, delta_sup)
+        prepared = prepare_energy_fold(dataset, fold; generator_variant, psi, num_scenarios,
+            num_scenarios_test, seed, beta, alpha, gamma, delta_inf, delta_sup)
+        train_oracles = prepared.train_oracles
+        validation_oracles = prepared.validation_oracles
+        test_oracles = prepared.test_oracles
+        coverage = scenario_interval_coverage(prepared.test_trees, c_test; level = 0.9)
+        energy_score = mean(scenario_energy_score(prepared.test_trees[k], c_test[:, k])
+            for k in 1:length(fold.test_indices))
+        push!(assessment, (fold.test_year, coverage, energy_score))
 
         fold_log = joinpath(output_dir, "fold_$(fold.test_year).log")
         log_file = open(fold_log, "w")
@@ -35,6 +43,9 @@ function run_energy_portfolio_cv(; data_dir = "data/training_dataset",
         println(log_file, "beta=$beta alpha=$alpha gamma=$gamma delta_inf=$delta_inf delta_sup=$delta_sup")
         println(log_file, "lambda=$(lambda) num_epochs=$(num_epochs) batchsize=$(batchsize) step_size=$(step_size)")
         println(log_file, "train=$(length(fold.train_indices)) validation=$(length(fold.validation_indices)) test=$(length(fold.test_indices))")
+        println(log_file, "num_scenarios=$num_scenarios num_scenarios_test=$num_scenarios_test seed=$seed")
+        write_generator_details(log_file, prepared)
+        println(log_file, "generator_test_coverage_90=$coverage generator_test_energy_score=$energy_score")
         println(log_file, "normalization feature_mean=$(normalization.feature_mean)")
         println(log_file, "normalization feature_scale=$(normalization.feature_scale)")
         println(log_file, "normalization cost_mean=$(normalization.cost_mean)")
@@ -101,6 +112,10 @@ function run_energy_portfolio_cv(; data_dir = "data/training_dataset",
             spo_metrics.mean_cost, spo_metrics.mean_cvar, energy_mse_loss(spo_model, X_test, c_test_normalized),
             mse_objective, spo_objective)
         push!(results, result)
+        # realized costs in real terms (price level ipca_ref) so that different years are comparable
+        deflator = dataset.ipca_ref ./ dataset.ipca_t[fold.test_indices]
+        append!(realized_test_costs.mse, mse_metrics.costs .* deflator)
+        append!(realized_test_costs.spo, spo_metrics.costs .* deflator)
 
         println(log_file, "FINAL MSE test_cost=$(result.mse_cost) test_cvar=$(result.mse_cvar) test_mse=$(result.mse_mse)")
         println(log_file, "FINAL SPO+ test_cost=$(result.spo_cost) test_cvar=$(result.spo_cvar) test_mse=$(result.spo_mse)")
@@ -114,10 +129,24 @@ function run_energy_portfolio_cv(; data_dir = "data/training_dataset",
     summary = _summary_statistics(results)
     _write_summary(joinpath(output_dir, "summary"), results, summary)
     _save_cv_plots(results, output_dir)
-    return (folds = folds, results = results, summary = summary, output_dir = output_dir)
+    CSV.write(joinpath(output_dir, "generator_assessment.csv"), assessment)
+    # Out-of-sample risk: CVaR of the real realized costs of all test decisions (pooled over folds).
+    realized_risk = DataFrame(method = ["MSE", "SPO+"],
+        realized_real_cost_mean = [mean(realized_test_costs.mse), mean(realized_test_costs.spo)],
+        realized_real_cost_cvar = [empirical_cvar(costs, fill(1.0 / length(costs), length(costs)), alpha)
+            for costs in (realized_test_costs.mse, realized_test_costs.spo)])
+    CSV.write(joinpath(output_dir, "realized_test_risk.csv"), realized_risk)
+    return (folds = folds, results = results, summary = summary, assessment = assessment,
+        realized_risk = realized_risk, output_dir = output_dir)
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    result = run_energy_portfolio_cv()
-    println(result.summary)
+    for variant in (:G1, :G2)
+        result = run_energy_portfolio_cv(generator_variant = variant,
+            output_dir = "energy_cv_results_$(variant)")
+        println(variant)
+        println(result.summary)
+        println(result.assessment)
+        println(result.realized_risk)
+    end
 end

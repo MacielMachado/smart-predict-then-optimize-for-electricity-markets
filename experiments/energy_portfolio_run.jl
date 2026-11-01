@@ -1,7 +1,9 @@
 include("../oracles/energy_portfolio_oracle.jl")
 include("../solver/energy_scenarios.jl")
+include("../solver/energy_scenario_generator.jl")
 include("../solver/energy_predictors.jl")
 include("../solver/energy_spo.jl")
+include("../solver/energy_cross_validation.jl")
 
 using Cairo, DataFrames, Fontconfig, Gadfly, LinearAlgebra, Printf, Statistics
 
@@ -9,21 +11,63 @@ const ENERGY_DEMAND = Float64[1050, 980, 1020, 1000, 970, 920,
     900, 890, 930, 980, 1010, 1050]
 const ENERGY_CONTRACT_PRICES = fill(280.0, 12)
 
-function build_energy_oracles(dataset::EnergyDataset, indices;
+# Calendar-month profile reordered so that position h is the h-th month after the decision.
+# (Contract prices are flat; if they ever vary by month they must be rotated here and in the
+# realized-cost computations below.)
+_rotate_months(values, start_month) = [values[mod1(start_month + h - 1, length(values))] for h in 1:length(values)]
+
+function build_energy_oracles(dataset::EnergyDataset, indices, scenario_trees;
     beta = 0.4, alpha = 0.95, gamma = 0.99,
     delta_inf = 0.9, delta_sup = 1.1)
-    probabilities = fill(0.25, 4)
-    return [build_energy_oracle(dataset.scenario_trees[i], probabilities,
-        ENERGY_DEMAND, ENERGY_CONTRACT_PRICES;
-        alpha = alpha, beta = beta, gamma = gamma,
-        delta_inf = delta_inf, delta_sup = delta_sup,
-        spot_upper_bound = ENERGY_DEMAND) for i in indices]
+    length(scenario_trees) == length(indices) || error("one scenario tree is required per sample")
+    oracles = EnergyPortfolioOracle[]
+    for (k, i) in enumerate(indices)
+        tree = scenario_trees[k]
+        num_scenarios = size(tree, 1)
+        demand = _rotate_months(ENERGY_DEMAND, dataset.start_months[i])
+        push!(oracles, build_energy_oracle(tree, fill(1.0 / num_scenarios, num_scenarios),
+            demand, ENERGY_CONTRACT_PRICES;
+            alpha = alpha, beta = beta, gamma = gamma,
+            delta_inf = delta_inf, delta_sup = delta_sup,
+            spot_upper_bound = demand))
+    end
+    return oracles
+end
+
+"""
+Fit the scenario generator of a fold (data up to `fold.generator_cutoff`), generate one scenario
+set per sample and build the oracles. Test samples use `num_scenarios_test` scenarios.
+"""
+function prepare_energy_fold(dataset::EnergyDataset, fold::EnergyYearFold;
+    generator_variant::Symbol = :G2, psi = 10.0, num_scenarios = 200,
+    num_scenarios_test = 1000, seed = 1,
+    beta = 0.4, alpha = 0.95, gamma = 0.99, delta_inf = 0.9, delta_sup = 1.1)
+    generator = fit_energy_scenario_generator(dataset.monthly, fold.generator_cutoff;
+        variant = generator_variant, psi = psi, ipca_ref = dataset.ipca_ref)
+    train_trees = build_energy_scenario_trees(dataset, generator, fold.train_indices;
+        num_scenarios = num_scenarios, seed = seed)
+    validation_trees = build_energy_scenario_trees(dataset, generator, fold.validation_indices;
+        num_scenarios = num_scenarios, seed = seed)
+    test_trees = build_energy_scenario_trees(dataset, generator, fold.test_indices;
+        num_scenarios = num_scenarios_test, seed = seed)
+    oracle_options = (beta = beta, alpha = alpha, gamma = gamma, delta_inf = delta_inf, delta_sup = delta_sup)
+    return (generator = generator,
+        train_trees = train_trees, validation_trees = validation_trees, test_trees = test_trees,
+        train_oracles = build_energy_oracles(dataset, fold.train_indices, train_trees; oracle_options...),
+        validation_oracles = build_energy_oracles(dataset, fold.validation_indices, validation_trees; oracle_options...),
+        test_oracles = build_energy_oracles(dataset, fold.test_indices, test_trees; oracle_options...))
+end
+
+function write_generator_details(io, prepared)
+    println(io, describe_energy_scenario_generator(prepared.generator))
+    for warning in check_energy_scenario_generator(prepared.generator)
+        println(io, "generator_warning=", warning)
+    end
 end
 
 function energy_metrics(model, X_normalized, c_raw, oracle_builders,
     normalization; beta = 0.4, alpha = 0.95, detailed = false)
     predictions_raw = denormalize_energy_cost(predict_energy(model, X_normalized), normalization)
-    probabilities = fill(0.25, 4)
     costs = Float64[]
     cvars = Float64[]
     objectives = Float64[]
@@ -33,7 +77,8 @@ function energy_metrics(model, X_normalized, c_raw, oracle_builders,
         realized_cost = dot(ENERGY_CONTRACT_PRICES, result.w) +
             dot(c_raw[:, i], result.action)
         push!(costs, realized_cost)
-        push!(cvars, empirical_cvar(result.scenario_costs, probabilities, alpha))
+        num_scenarios = length(result.scenario_costs)
+        push!(cvars, empirical_cvar(result.scenario_costs, fill(1.0 / num_scenarios, num_scenarios), alpha))
         push!(objectives, (1.0 - beta) * realized_cost + beta * cvars[end])
         detailed && push!(results, result)
     end
@@ -45,7 +90,6 @@ end
 
 function energy_spo_objective(B, X_normalized, c_normalized, oracle_builders,
     normalization, beta, alpha, lambda)
-    probabilities = fill(0.25, 4)
     values = Float64[]
     c_mean = normalization.cost_mean
     c_scale = normalization.cost_scale
@@ -54,6 +98,7 @@ function energy_spo_objective(B, X_normalized, c_normalized, oracle_builders,
         chat_raw = (B * X_normalized[:, i]) .* c_scale .+ c_mean
         true_result = oracle_builders[i](c_raw)
         auxiliary_result = oracle_builders[i](2.0 .* chat_raw .- c_raw)
+        probabilities = fill(1.0 / length(true_result.xi), length(true_result.xi))
         theta_chat_dot_true = (1.0 - beta) * dot(ENERGY_CONTRACT_PRICES, true_result.w) +
             beta * true_result.eta +
             beta / (1.0 - alpha) * dot(probabilities, true_result.xi) +
@@ -68,9 +113,9 @@ function write_portfolio_details(io, epoch, label, indices, dataset, metrics)
     println(io, "PORTFOLIOS epoch=$epoch split=$label")
     for (local_index, dataset_index) in enumerate(indices)
         result = metrics.results[local_index]
-        println(io, "sample=$dataset_index year=$(dataset.years[dataset_index]) week=$(dataset.weeks[dataset_index])")
-        for month in 1:12
-            println(io, "month=$month date=$(dataset.dates[dataset_index][month]) " *
+        println(io, "sample=$dataset_index decision_date=$(dataset.decision_dates[dataset_index])")
+        for month in 1:ENERGY_HORIZON
+            println(io, "month=$month date=$(dataset.target_months[dataset_index][month]) " *
                 "w=$(result.w[month]) e_plus=$(result.e_plus[month]) " *
                 "e_minus=$(result.e_minus[month])")
         end
@@ -121,18 +166,23 @@ function run_energy_portfolio(; data_dir = "data/training_dataset",
     log_path = "energy_portfolio_training.log", beta = 0.4,
     alpha = 0.95, gamma = 0.99, delta_inf = 0.9, delta_sup = 1.1,
     lambda = 1e-4, num_epochs = 2000, batchsize = 100,
-    step_size = 1e-8, plot_dir = "energy_portfolio_plots")
+    step_size = 1e-8, plot_dir = "energy_portfolio_plots",
+    test_year = 2019, min_train_years = 5, generator_variant = :G2, psi = 10.0,
+    num_scenarios = 200, num_scenarios_test = 1000, seed = 1)
     dataset = load_energy_dataset(data_dir)
-    splits = energy_split_indices(dataset)
-    normalization = fit_energy_normalization(dataset.X[:, splits.train], dataset.c[:, splits.train])
+    fold = only(build_energy_year_folds(dataset; first_test_year = test_year,
+        last_test_year = test_year, min_train_years))
+    normalization = fit_energy_normalization(dataset.X[:, fold.train_indices], dataset.c[:, fold.train_indices])
     X_normalized, c_normalized = normalize_energy_data(dataset.X, dataset.c, normalization)
 
-    train_indices = splits.train
-    validation_indices = splits.validation
-    test_indices = splits.test
-    train_oracles = build_energy_oracles(dataset, train_indices; beta, alpha, gamma, delta_inf, delta_sup)
-    validation_oracles = build_energy_oracles(dataset, validation_indices; beta, alpha, gamma, delta_inf, delta_sup)
-    test_oracles = build_energy_oracles(dataset, test_indices; beta, alpha, gamma, delta_inf, delta_sup)
+    train_indices = fold.train_indices
+    validation_indices = fold.validation_indices
+    test_indices = fold.test_indices
+    prepared = prepare_energy_fold(dataset, fold; generator_variant, psi, num_scenarios,
+        num_scenarios_test, seed, beta, alpha, gamma, delta_inf, delta_sup)
+    train_oracles = prepared.train_oracles
+    validation_oracles = prepared.validation_oracles
+    test_oracles = prepared.test_oracles
 
     X_train = X_normalized[:, train_indices]
     c_train_normalized = c_normalized[:, train_indices]
@@ -144,8 +194,11 @@ function run_energy_portfolio(; data_dir = "data/training_dataset",
     mse_model = fit_energy_ridge(X_train, c_train_normalized, lambda)
     log_file = open(log_path, "w")
     println(log_file, "ENERGY PORTFOLIO TRAINING")
+    println(log_file, "test_year=$(fold.test_year) validation_year=$(fold.validation_year) train_years=$(fold.train_years)")
     println(log_file, "beta=$beta alpha=$alpha gamma=$gamma delta_inf=$delta_inf delta_sup=$delta_sup")
     println(log_file, "epochs=$num_epochs batchsize=$batchsize step_size=$step_size lambda=$lambda")
+    println(log_file, "num_scenarios=$num_scenarios num_scenarios_test=$num_scenarios_test seed=$seed")
+    write_generator_details(log_file, prepared)
     println(log_file, "train=$(length(train_indices)) validation=$(length(validation_indices)) test=$(length(test_indices))")
     println(log_file, "normalization feature_mean=$(normalization.feature_mean)")
     println(log_file, "normalization feature_scale=$(normalization.feature_scale)")
@@ -220,7 +273,7 @@ function run_energy_portfolio(; data_dir = "data/training_dataset",
     save_training_plots(history_series, mse_baseline, plot_dir)
     close(log_file)
 
-    return (dataset = dataset, splits = splits, normalization = normalization,
+    return (dataset = dataset, fold = fold, generator = prepared.generator, normalization = normalization,
         mse_model = mse_model, spo_model = spo_model, history = history,
         history_series = history_series, mse_baseline = mse_baseline,
         mse_test = mse_test_metrics, spo_test = test_metrics, log_path = log_path)

@@ -1,4 +1,4 @@
-using Cairo, CSV, DataFrames, Fontconfig, Gadfly, Statistics
+using Cairo, CSV, DataFrames, Dates, Fontconfig, Gadfly, Statistics
 
 struct EnergyYearFold
     test_year::Int
@@ -7,6 +7,7 @@ struct EnergyYearFold
     train_indices::Vector{Int}
     validation_indices::Vector{Int}
     test_indices::Vector{Int}
+    generator_cutoff::Date      # last month used to fit the scenario generator of the fold
 end
 
 struct EnergyYearEvaluation
@@ -22,39 +23,42 @@ struct EnergyYearEvaluation
     spo_objective::Float64
 end
 
-function _year_indices(dataset, year_value)
-    return findall(==(year_value), dataset.years)
+"""
+Fold with test decisions in `test_year` and validation decisions in `test_year - 1`. Training
+samples are the decisions whose twelve target months all end by December of `test_year - 2`, so
+no realized price of the validation or test period enters training, normalization or the scenario
+generator (fitted with months up to the same cutoff).
+"""
+function _rolling_origin_fold(dataset::EnergyDataset, test_year::Integer)
+    validation_year = test_year - 1
+    cutoff = Date(test_year - 2, 12, 1)
+    train_indices = findall(months -> last(months) <= cutoff, dataset.target_months)
+    validation_indices = findall(==(validation_year), dataset.years)
+    test_indices = findall(==(test_year), dataset.years)
+    train_years = sort(unique(dataset.years[train_indices]))
+    return EnergyYearFold(test_year, validation_year, train_years, train_indices,
+        validation_indices, test_indices, cutoff)
 end
 
 function build_energy_year_folds(dataset::EnergyDataset;
     evaluation_mode::Symbol = :rolling_origin,
-    first_test_year = nothing, last_test_year = nothing)
-    evaluation_mode in (:leave_one_year_out, :rolling_origin) ||
-        error("evaluation_mode must be :leave_one_year_out or :rolling_origin")
-    years = sort(unique(dataset.years))
-    default_first_year = evaluation_mode == :rolling_origin ? years[3] : years[2]
-    first_year = isnothing(first_test_year) ? default_first_year : first_test_year
-    last_year = isnothing(last_test_year) ? years[end] : last_test_year
+    first_test_year = nothing, last_test_year = nothing, min_train_years::Integer = 5)
+    # With twelve-month targets, leave-one-year-out would train on later years.
+    evaluation_mode == :rolling_origin || error("evaluation_mode must be :rolling_origin")
     folds = EnergyYearFold[]
-    for test_year in years
-        test_year < first_year && continue
-        test_year > last_year && continue
-        validation_year = test_year - 1
-        validation_year in years || continue
-        train_years = if evaluation_mode == :rolling_origin
-            filter(year_value -> year_value < validation_year, years)
-        else
-            filter(year_value -> year_value != validation_year && year_value != test_year, years)
+    for test_year in sort(unique(dataset.years))
+        !isnothing(first_test_year) && test_year < first_test_year && continue
+        !isnothing(last_test_year) && test_year > last_test_year && continue
+        fold = _rolling_origin_fold(dataset, test_year)
+        (isempty(fold.validation_indices) || isempty(fold.test_indices)) && continue
+        if length(fold.train_years) < min_train_years
+            isnothing(first_test_year) ||
+                @warn "test year $test_year skipped: fewer than $min_train_years training years"
+            continue
         end
-        isempty(train_years) && continue
-        train_indices = sort(vcat([_year_indices(dataset, year_value) for year_value in train_years]...))
-        validation_indices = _year_indices(dataset, validation_year)
-        test_indices = _year_indices(dataset, test_year)
-        length(validation_indices) == 4 || error("validation year must have four samples")
-        length(test_indices) == 4 || error("test year must have four samples")
-        push!(folds, EnergyYearFold(test_year, validation_year, train_years,
-            train_indices, validation_indices, test_indices))
+        push!(folds, fold)
     end
+    isempty(folds) && error("no fold satisfies the requested test years and min_train_years")
     return folds
 end
 
