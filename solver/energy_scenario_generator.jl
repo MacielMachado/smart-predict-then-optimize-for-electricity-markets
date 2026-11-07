@@ -193,15 +193,105 @@ function generate_energy_scenarios(generator::EnergyScenarioGenerator, decision_
     return scenarios
 end
 
-"""Generate one scenario matrix per dataset sample in `indices` (reproducible per sample)."""
+"""
+Generate one scenario matrix per dataset sample in `indices` (reproducible per sample), in real
+terms: the price level is the generator's reference (`nominal` factor 1) and the bounds are the
+real limits in force at each decision date, consistent with the real cost vectors of the dataset.
+"""
 function build_energy_scenario_trees(dataset, generator::EnergyScenarioGenerator, indices;
     num_scenarios::Integer = 200, seed::Integer = 1)
+    isapprox(generator.ipca_ref, dataset.ipca_ref) || error("generator and dataset use different ipca_ref")
     return [generate_energy_scenarios(generator, dataset.decision_dates[i], dataset.ena_prev[i],
-                dataset.ear_prev[i], dataset.cmo_real_prev[i], dataset.ipca_t[i],
-                dataset.pld_min[i], dataset.pld_max[i];
+                dataset.ear_prev[i], dataset.cmo_real_prev[i], generator.ipca_ref,
+                dataset.pld_min_real[i], dataset.pld_max_real[i];
                 horizon = size(dataset.c, 1), num_scenarios = num_scenarios,
                 rng = MersenneTwister(seed + 7919 * i))
             for i in indices]
+end
+
+"""
+    energy_storage_statistics(generator; threshold, num_months, rng)
+
+Long-run mean of χ(E) and frequency of E < `threshold` under the generator's inflow and storage
+dynamics (which do not depend on the CMO equation). Used to recentre the CMO intercept when the
+storage effects are changed in synthetic histories.
+"""
+function energy_storage_statistics(generator::EnergyScenarioGenerator; threshold::Real = 30.0,
+    num_months::Integer = 240_000, rng = MersenneTwister(12345))
+    generator.variant == :G2 || error("storage statistics require a G2 generator")
+    a = 0.0
+    E = 50.0
+    chi_sum = 0.0
+    below = 0
+    burn_in = 1200
+    for k in 1:(burn_in + num_months)
+        month_value = mod1(k, 12)
+        season = _energy_season(month_value)
+        j = rand(rng, generator.pools[season])
+        a_next = generator.phi[season] * a + generator.residuals[j, 1]
+        chi_now = _energy_chi(E)                  # storage at the beginning of the month
+        below_now = E < threshold
+        E = clamp(dot(generator.gamma_e, _energy_fourier(month_value)) + generator.rho_e * E +
+            generator.b_ea * a_next + generator.residuals[j, 2], 0.0, 100.0)
+        a = a_next
+        k <= burn_in && continue
+        chi_sum += chi_now
+        below += below_now
+    end
+    return (mean_chi = chi_sum / num_months, share_below = below / num_months)
+end
+
+"""
+    simulate_energy_history(generator, first_month, num_months; ...)
+
+Synthetic monthly history drawn from a fitted G2 generator, used as a known data-generating process.
+Returns a monthly table with the same columns as mensal_SE.csv (constant price index, so nominal =
+real; PLD = CMO bounded by constant limits, no basis). The CMO equation is
+
+    y' = Λ(ν;γ^y) + intercept_shift + ρ_y y + b_ya a' + b_ye χ(E) + spike 1{E < spike_threshold} + noise_scale ε^y
+
+Knobs:
+- `b_ye`: absolute strength of the smooth nonlinear storage effect χ(E) = -log(E/100)
+  (default: the fitted value);
+- `spike`, `spike_threshold`: a jump of the log CMO when storage is below the threshold (a threshold
+  nonlinearity, absent by default);
+- `noise_scale`: multiplies the CMO innovations ε^y;
+- `intercept_shift`: added to the CMO intercept (use it to keep the mean price level when the storage
+  effects change; see `energy_storage_statistics`).
+A burn-in of `burn_in` months from a neutral state is discarded.
+"""
+function simulate_energy_history(generator::EnergyScenarioGenerator, first_month::Date, num_months::Integer;
+    b_ye::Real = generator.b_ye, spike::Real = 0.0, spike_threshold::Real = 30.0,
+    noise_scale::Real = 1.0, intercept_shift::Real = 0.0, pld_min::Real, pld_max::Real,
+    burn_in::Integer = 120, rng = Random.default_rng())
+    generator.variant == :G2 || error("synthetic histories require a G2 generator")
+    day(first_month) == 1 || error("first_month must be the first day of a month")
+    start = first_month - Month(burn_in)
+    a = 0.0
+    y = (generator.gamma_y[1] + intercept_shift) / (1 - generator.rho_y)   # rough level; the burn-in removes it
+    E = 50.0
+    rows = NamedTuple[]
+    for k in 1:(burn_in + num_months)
+        date = start + Month(k - 1)
+        month_value = month(date)
+        season = _energy_season(month_value)
+        j = rand(rng, generator.pools[season])
+        fourier = _energy_fourier(month_value)
+        a_next = generator.phi[season] * a + generator.residuals[j, 1]
+        y_next = dot(generator.gamma_y, fourier) + intercept_shift + generator.rho_y * y +
+            generator.b_ya * a_next + b_ye * _energy_chi(E) + spike * (E < spike_threshold) +
+            noise_scale * generator.residuals[j, 3]
+        E_next = clamp(dot(generator.gamma_e, fourier) + generator.rho_e * E +
+            generator.b_ea * a_next + generator.residuals[j, 2], 0.0, 100.0)
+        a, y, E = a_next, y_next, E_next
+        k <= burn_in && continue
+        cmo = max(exp(y) - generator.psi, 0.0)
+        push!(rows, (mes = date,
+            ena = exp(generator.mu[month_value] + generator.sigma[month_value] * a),
+            ear = E, cmo = cmo, pld = clamp(cmo, Float64(pld_min), Float64(pld_max)),
+            pld_min = Float64(pld_min), pld_max = Float64(pld_max), ipca = generator.ipca_ref))
+    end
+    return DataFrame(rows)
 end
 
 """Sign and range checks of the fitted coefficients (empty when everything is as expected)."""
