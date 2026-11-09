@@ -56,13 +56,12 @@ function run_energy_portfolio_cv(; data_dir = "data/training_dataset",
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    for variant in (:G1, :G2)
-        result = run_energy_portfolio_cv(generator_variant = variant,
-            output_dir = "energy_cv_results_$(variant)")
-        println(variant)
-        println(result.summary)
-        println(_paired_comparisons(result.results))
-        println(result.assessment)
-        println(result.realized_risk)
-    end
+    # G1 and G2 gave equivalent results, so only G2 is run. Pass the frozen SPO+ setting chosen in the
+    # synthetic development run as keywords, e.g. run_energy_portfolio_cv(step_size = 0.02,
+    # spo_averaging = true, spo_epoch0_eligible = true, num_epochs = 50, eval_every = 5).
+    result = run_energy_portfolio_cv(generator_variant = :G2, output_dir = "energy_cv_results_G2")
+    println(result.summary)
+    println(_paired_comparisons(result.results))
+    println(result.assessment)
+    println(result.realized_risk)
 end

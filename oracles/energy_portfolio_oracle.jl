@@ -86,6 +86,10 @@ function build_energy_oracle(pld_scenarios::AbstractMatrix{<:Real},
     end
     model = Model(optimizer_factory)
     set_optimizer_attribute(model, "OutputFlag", output_flag ? 1 : 0)
+    # Solve every call from scratch: the problem can have several optimal decisions with the same
+    # objective but different realized costs, and a warm start from the previous call would make the
+    # returned one depend on the order of the calls (results would not be reproducible).
+    set_optimizer_attribute(model, "LPWarmStart", 0)
 
     @variable(model, w[1:T] >= 0)
     @variable(model, e_plus[1:T] >= 0)
